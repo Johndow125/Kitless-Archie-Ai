@@ -1,0 +1,36 @@
+Kitless Terms of Service
+
+Effective date: 8 July 2026
+
+1. Acceptance
+By using Kitless, you agree to these Terms of Service. If you do not agree, do not use the software or connect to a Kitless server.
+
+2. Open-source software
+Kitless is provided as open-source software. You may inspect, modify, and run the code subject to the applicable project licence. You are responsible for understanding the code you run and the server you connect to.
+
+3. User responsibility
+You are responsible for your device, your server configuration, your submitted content, your generated teaching data, your use of AI output, and any consequences arising from your use, modification, hosting, or distribution of Kitless.
+
+4. Acceptable use
+You must not use Kitless to attack systems, distribute malware, harass people, generate unlawful content, upload material you do not have permission to use, poison the shared model, overload servers, or interfere with other users.
+
+5. Developer tools
+The developer client can generate and upload teaching data. You are responsible for reviewing generated data before upload and ensuring you have the right to use any submitted content.
+
+6. AI output disclaimer
+Archie may produce incorrect, incomplete, offensive, outdated, or misleading output. AI output is not professional advice. Do not rely on Kitless for medical, legal, financial, emergency, safety-critical, or other high-risk decisions.
+
+7. Contributed compute
+When training or swarm chat is enabled, your device may use CPU, GPU, memory, storage, network bandwidth, and electrical power. You are responsible for monitoring your own device, costs, performance, and limits.
+
+8. No warranty
+Kitless is provided as-is and as-available. To the maximum extent permitted by law, the author and contributors disclaim all warranties, including accuracy, reliability, uptime, security, fitness for a particular purpose, and non-infringement.
+
+9. Limitation of liability
+To the maximum extent permitted by law, the Kitless author and contributors are not liable for anything arising from or connected with Kitless, including loss, damage, claim, data loss, hardware issue, service interruption, security issue, misuse, user content, user conduct, teaching data, model training, model output, swarm chat, server operation, third-party deployment, modified builds, redistribution, or data handling by any operator or user.
+
+10. Third-party servers and modified builds
+Kitless may be hosted, modified, redistributed, or operated by anyone. Every operator and user is responsible for their own copy, server, settings, data, users, laws, and actions. The original author and contributors accept no responsibility for third-party servers, modified versions, public deployments, redistributed copies, or any consequences of using the open-source code.
+
+11. Changes
+These terms may be updated as Kitless changes. Continued use after changes means you accept the updated terms.

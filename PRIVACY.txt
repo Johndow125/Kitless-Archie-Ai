@@ -1,0 +1,36 @@
+Kitless Privacy Policy
+
+Effective date: 8 July 2026
+
+1. Overview
+Kitless is an open-source distributed AI network that allows users to chat with Archie, synchronise model checkpoints, contribute training work, generate teaching packs, and optionally assist with swarm chat inference. This Privacy Policy explains what information may be processed when you use the Kitless public client or developer client.
+
+2. Open-source software
+Kitless client code is intended to be open-source. Users and operators are responsible for reviewing the code, configuration, server address, and deployment before use. Open-source availability does not guarantee security, accuracy, uptime, or suitability for any purpose.
+
+3. Information stored on your device
+The Kitless client may store a client identifier, synchronised model files such as model.pt, local checkpoint data, training logs, graph history, optional TensorBoard files, and local application settings. The developer client may also store generated teaching packs and additional developer tool data. These files are used to operate the application and participate in the network.
+
+4. Information sent to the Kitless server
+The client may send connection status, heartbeat information, client mode, uploaded teaching packs, training results, model improvement metadata, chat messages submitted through SWARM CHAT, and swarm chat shard scores. This information is used to co-ordinate model synchronisation, distributed training, teaching data, online client counts, and chat assistance.
+
+5. Ollama and local tools
+When using the Ollama Teacher feature in the developer client, prompts are sent to the configured Ollama service. Review generated teaching data before upload, especially if it may include sensitive, unwanted, copyrighted, or third-party content.
+
+6. Information not intentionally collected
+The Kitless client is not designed to collect passwords, payment details, browser history, unrelated documents, or private files outside the Kitless application folders. Users should still avoid typing or uploading sensitive personal data into chat, training tasks, or teaching material.
+
+7. User-submitted content
+Messages, teaching packs, training contributions, and other submitted content may be processed by the Kitless server and by participating clients when swarm features are enabled. Do not submit private, confidential, illegal, or third-party content unless you have the right to do so.
+
+8. Network and compute participation
+When connected, the client may use network bandwidth. When training or swarm chat features are enabled, the client may use CPU, GPU, memory, disk, and power resources to support the network.
+
+9. No responsibility for user deployments
+Kitless is open-source software. To the maximum extent permitted by law, the Kitless author and contributors are not responsible for anything arising from use, misuse, hosting, deployment, configuration, modification, redistribution, server operation, data handling, user content, user conduct, teaching data, model training, swarm chat, AI output, or third-party services connected with Kitless.
+
+10. Security
+No online system can be guaranteed secure. Users should run Kitless only from trusted sources, review code before use, keep dependencies updated, and avoid submitting sensitive information.
+
+11. Changes
+This policy may be updated as Kitless changes. Continued use of the client after changes means you accept the updated policy.

@@ -1,0 +1,16 @@
+Kitless Open-source Licence Notice
+
+Effective date: 8 July 2026
+
+Kitless is released as open-source software. You may inspect, use, copy, modify, host, and redistribute the Kitless source code.
+
+By using, hosting, changing, or sharing Kitless, you accept that you do so at your own risk and take responsibility for your own copy, server, users, data, and actions.
+
+No warranty
+Kitless is provided as-is and as-available. The author and contributors give no warranties, guarantees, or promises about the software, model, network, outputs, safety, reliability, security, or fitness for any purpose.
+
+No responsibility
+To the maximum extent permitted by law, the author and contributors accept no responsibility or liability for anything arising from use, misuse, hosting, modification, redistribution, server operation, user content, teaching data, model training, swarm chat, AI output, or third-party deployments of Kitless.
+
+Operator responsibility
+Anyone who hosts, modifies, redistributes, or operates Kitless is responsible for their own copy, server, settings, users, data, laws, and actions.
