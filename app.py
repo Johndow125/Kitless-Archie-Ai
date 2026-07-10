@@ -33,8 +33,9 @@ PROJECT_ROOT = APP_DIR.parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
+from shared.chat_reply import chat_answer_from_label, direct_chat_reply
 from shared.help_docs import load_doc, show_help_window
-from shared.settings import TARGET_LOSS, training_loss_accepted
+from shared.settings import TARGET_LOSS, MASTERED_LOSS, chat_mode_label, training_loss_accepted
 CLIENT_DATA_DIR = APP_DIR / "client_data"
 CLIENT_CHECKPOINT_DIR = APP_DIR / "client_checkpoint"
 CLIENT_ID_FILE = CLIENT_DATA_DIR / "client_id.txt"
@@ -52,8 +53,8 @@ DEFAULT_API_KEY_PARTS = (
 MODEL_KIND = "kitless-linear-archie-v1"
 CHAT_WELCOME = (
     "Archie chat is here.\n"
-    "This client auto-connects and auto-syncs when the Kitless server is online.\n"
-    "Type below and press SEND TO ARCHIE.\n\n"
+    "Connected clients share CPU power to answer together — the server only coordinates the swarm.\n"
+    "Type below and press SEND TO ARCHIE. Press START TRAINING to join network training power.\n\n"
 )
 
 
@@ -260,6 +261,24 @@ def save_local_package(package: dict) -> None:
     torch.save(package, LATEST_MODEL_FILE)
 
 
+def best_label_from_output_shard(package: dict, msg: str, start: int, end: int) -> tuple[int, str, float]:
+    labels = package.get("labels") or []
+    state_dict = package.get("state_dict") or {}
+    if not labels or start < 0 or end <= start or end > len(labels):
+        raise RuntimeError("Invalid swarm chat shard.")
+    weight = state_dict.get("weight")
+    bias = state_dict.get("bias")
+    if weight is None:
+        raise RuntimeError("Synchronised model has no output weights.")
+    x = vectorise(msg, package["vocab"])
+    shard_logits = x.matmul(weight[start:end].t())[0]
+    if bias is not None:
+        shard_logits = shard_logits + bias[start:end]
+    local_idx = int(torch.argmax(shard_logits).item())
+    label_index = start + local_idx
+    return label_index, labels[label_index], float(shard_logits[local_idx].item())
+
+
 def loss_for_package(package: dict, prompt: str, target: str) -> float:
     labels = package.get("labels") or []
     if target not in labels:
@@ -294,17 +313,18 @@ class ClientApp(tk.Tk):
         self.loss_history: list[tuple[float, float]] = []
         self.graph_visible = tk.BooleanVar(value=False)
         self.log_visible = tk.BooleanVar(value=False)
+        self._swarm_thread_started = False
         self._build()
         if not self.show_startup_disclaimer():
             return
         self.deiconify()
         self._build_menu()
         self.apply_view_menu()
-        self.after(500, self.auto_startup_sync)
+        self.after(500, self.auto_startup_connect)
         self.after(1500, self._heartbeat_loop)
 
-    def auto_startup_sync(self) -> None:
-        threading.Thread(target=lambda: self.sync_model(silent=True), daemon=True).start()
+    def auto_startup_connect(self) -> None:
+        threading.Thread(target=lambda: self.connect(silent=True), daemon=True).start()
 
     def show_startup_disclaimer(self) -> bool:
         if DISCLAIMER_ACCEPTED_FILE.exists():
@@ -392,7 +412,7 @@ class ClientApp(tk.Tk):
         hero = tk.Frame(self, bg="#101623", padx=18, pady=14)
         hero.pack(fill=tk.X)
         tk.Label(hero, text="Kitless", fg="#ffffff", bg="#101623", font=("Segoe UI", 24, "bold")).pack(anchor=tk.W)
-        tk.Label(hero, text="Public Client - chat with Archie and contribute training power", fg="#9fb3d1", bg="#101623", font=("Segoe UI", 11)).pack(anchor=tk.W)
+        tk.Label(hero, text="Public Client — swarm chat and shared training power across the network", fg="#9fb3d1", bg="#101623", font=("Segoe UI", 11)).pack(anchor=tk.W)
 
         card = ttk.Frame(self, padding=12)
         card.pack(fill=tk.X, padx=14, pady=8)
@@ -402,7 +422,6 @@ class ClientApp(tk.Tk):
         ttk.Entry(card, textvariable=self.api_key, width=18, show="*").pack(side=tk.LEFT, padx=6)
         ttk.Button(card, text="SAVE", command=lambda: self.save_connection_settings(silent=False)).pack(side=tk.LEFT, padx=4)
         ttk.Button(card, text="CONNECT", command=self.connect).pack(side=tk.LEFT, padx=4)
-        ttk.Button(card, text="SYNC MODEL", command=self.sync_model).pack(side=tk.LEFT, padx=4)
         self.training_btn = ttk.Button(card, text="START TRAINING", command=self.toggle_contribute)
         self.training_btn.pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(card, text="KEEP RETRAINING", variable=self.keep_training).pack(side=tk.LEFT, padx=4)
@@ -418,7 +437,7 @@ class ClientApp(tk.Tk):
 
         stats = ttk.LabelFrame(self, text="Network", padding=12)
         stats.pack(fill=tk.X, padx=14, pady=8)
-        self.online_lbl = ttk.Label(stats, text="Online: 0")
+        self.online_lbl = ttk.Label(stats, text="Pool: 0")
         self.online_lbl.pack(side=tk.LEFT, padx=10)
         self.version_lbl = ttk.Label(stats, text="Model build: 0")
         self.version_lbl.pack(side=tk.LEFT, padx=10)
@@ -426,6 +445,8 @@ class ClientApp(tk.Tk):
         self.steps_lbl.pack(side=tk.LEFT, padx=10)
         self.weights_lbl = ttk.Label(stats, text="Weights: 0")
         self.weights_lbl.pack(side=tk.LEFT, padx=10)
+        self.learned_lbl = ttk.Label(stats, text="Learned: 0")
+        self.learned_lbl.pack(side=tk.LEFT, padx=10)
         self.tasks_lbl = ttk.Label(stats, text="Open tasks: 0")
         self.tasks_lbl.pack(side=tk.LEFT, padx=10)
         self.packs_lbl = ttk.Label(stats, text="Teaching packs: 0")
@@ -547,13 +568,11 @@ class ClientApp(tk.Tk):
             (
                 "Kitless Public Client FAQ\n\n"
                 "Talk To Archie\n"
-                "Type a message and press SEND TO ARCHIE. Archie answers from the synchronised model.pt on this computer.\n\n"
+                "Type a message and press SEND TO ARCHIE. Online clients share CPU to score answer shards; the server combines the best swarm reply.\n\n"
                 "CONNECT\n"
                 "Connects this client to the Kitless server.\n\n"
-                "SYNC MODEL\n"
-                "Downloads the latest shared Archie model.pt to this computer.\n\n"
                 "START TRAINING / STOP TRAINING\n"
-                "Starts or pauses local training contribution. While training is on, this computer helps improve the shared model.\n\n"
+                "Join network power — your CPU/GPU helps train the shared model on the server.\n\n"
                 "KEEP RETRAINING\n"
                 "Keeps asking the server for more training work after a task finishes.\n\n"
                 "Training Power: CPU / GPU / BOTH\n"
@@ -564,12 +583,8 @@ class ClientApp(tk.Tk):
                 "The Training Graph shows local loss before and after training. The Terminal Log shows client events and errors. Clear Chat wipes the chat window on this PC only.\n\n"
                 "Clear Chat\n"
                 "Use CLEAR CHAT or View -> Clear Chat when you are finished. This only clears the chat display on your computer. It does not delete server training data.\n\n"
-                "How Sync Works\n"
-                "Model sync downloads the latest shared Archie model.pt to this computer.\n"
-                "- On startup: about half a second after the client opens, if the server is online.\n"
-                "- While training: after each training task your client completes and the server accepts.\n"
-                "- Manual: click SYNC MODEL any time.\n"
-                "Sending a chat message does not download a new model.pt. The message is sent to the server straight away for Archie to answer, and good question-and-answer pairs may be queued for future training.\n"
+                "Join Power\n"
+                "Each client syncs the shared network model, helps answer swarm chat shards while connected, and can press START TRAINING to improve the model.\n"
                 "Network status (online count, open tasks, model build) refreshes about every 3 seconds while connected.\n\n"
                 "Graph Colours\n"
                 "Green is loss before training. Blue is loss after training. Lower blue means the task improved.\n"
@@ -636,7 +651,10 @@ class ClientApp(tk.Tk):
             self.connected = True
             self.status.configure(text="Connected")
             self.apply_status(data["status"])
-            self.log_line("Connected to Kitless Server.")
+            self.sync_model_from_server(silent=True)
+            self.ensure_swarm_helper()
+            pool_size = int((data.get("status") or {}).get("pool_size", (data.get("status") or {}).get("online", 0)) or 0)
+            self.log_line(f"Joined network pool ({pool_size} client(s) sharing CPU).")
             return True
         except Exception as e:
             if silent:
@@ -646,15 +664,86 @@ class ClientApp(tk.Tk):
             return False
 
     def apply_status(self, s: dict) -> None:
-        self.online_lbl.configure(text=f"Online: {s.get('online', 0)}")
+        self.online_lbl.configure(text=f"Pool: {s.get('pool_size', s.get('online', 0))}")
         self.version_lbl.configure(text=f"Model build: {s.get('model_version', 0)}")
         self.steps_lbl.configure(text=f"Training steps: {s.get('training_steps', s.get('contributions', 0))}")
         self.weights_lbl.configure(text=f"Weights: {s.get('model_weights', 0)}")
+        self.learned_lbl.configure(text=f"Learned: {s.get('learned_answers', 0)}")
         self.tasks_lbl.configure(text=f"Open tasks: {s.get('open_tasks', 0)}")
         self.packs_lbl.configure(text=f"Teaching packs: {s.get('packs_received', 0)}")
         self.done_lbl.configure(text=f"Completed: {s.get('completed_tasks', 0)}")
         self.contrib_lbl.configure(text=f"Contributions: {s.get('contributions', 0)}")
         self.round_lbl.configure(text=f"Round: {s.get('training_round', 0)}")
+        self.maybe_sync_model(s.get("model_version", 0))
+
+    def sync_model_from_server(self, silent: bool = False) -> bool:
+        try:
+            data = http_json("GET", self.server_url.get() + "/model", timeout=60)
+            package = package_from_b64(data["model_package"])
+            if package.get("kind") != MODEL_KIND:
+                raise RuntimeError("Server sent unknown model kind.")
+            package["version"] = data.get("model_version", package.get("version", 0))
+            package["training_steps"] = data.get("training_steps", package.get("training_steps", 0))
+            save_local_package(package)
+            self.local_model = package
+            if not silent:
+                self.log_line(f"Synchronised network model build {package['version']}.")
+            return True
+        except Exception as e:
+            if not silent:
+                self.log_line(f"Model sync failed: {e}")
+            return False
+
+    def maybe_sync_model(self, remote_version: int) -> None:
+        if int(remote_version or 0) != int(self.local_model.get("version", 0) or 0):
+            threading.Thread(target=lambda: self.sync_model_from_server(silent=True), daemon=True).start()
+
+    def ensure_swarm_helper(self) -> None:
+        if self._swarm_thread_started:
+            return
+        self._swarm_thread_started = True
+        threading.Thread(target=self.swarm_helper_loop, daemon=True).start()
+
+    def swarm_helper_loop(self) -> None:
+        while True:
+            if not self.connected:
+                threading.Event().wait(1)
+                continue
+            try:
+                if not self.local_model.get("state_dict"):
+                    self.sync_model_from_server(silent=True)
+                    threading.Event().wait(2)
+                    continue
+                work = http_json(
+                    "POST",
+                    self.server_url.get() + "/chat_work",
+                    {"client_id": self.client_id},
+                    timeout=8,
+                )
+                if not work.get("job_id"):
+                    threading.Event().wait(1)
+                    continue
+                label_index, label, score = best_label_from_output_shard(
+                    self.local_model,
+                    str(work.get("message", "")),
+                    int(work.get("start", 0)),
+                    int(work.get("end", 0)),
+                )
+                http_json(
+                    "POST",
+                    self.server_url.get() + "/chat_result",
+                    {
+                        "client_id": self.client_id,
+                        "job_id": work["job_id"],
+                        "shard_index": work["shard_index"],
+                        "label_index": label_index,
+                        "label": label,
+                        "score": score,
+                    },
+                    timeout=8,
+                )
+            except Exception:
+                threading.Event().wait(2)
 
     def _heartbeat_loop(self) -> None:
         if self.connected:
@@ -688,7 +777,7 @@ class ClientApp(tk.Tk):
                     "POST",
                     self.server_url.get() + "/task",
                     {"client_id": self.client_id, "keep_training": self.keep_training.get()},
-                    timeout=8,
+                    timeout=60,
                 )
                 task = data.get("task")
                 if not task:
@@ -701,7 +790,7 @@ class ClientApp(tk.Tk):
                     "POST",
                     self.server_url.get() + "/submit",
                     {"client_id": self.client_id, "task_id": task["id"], "result": result},
-                    timeout=10,
+                    timeout=120,
                 )
                 if submit.get("accepted"):
                     swarm = submit.get("swarm") or {}
@@ -710,7 +799,6 @@ class ClientApp(tk.Tk):
                         self.log_line,
                         f"Shared task {task['id'][:8]} accepted. Swarm {swarm.get('contributors', 0)}/{swarm.get('target_contributions', 1)}. Step {submit.get('training_steps')}. Build {submit.get('model_version')}.",
                     )
-                    self.sync_model(silent=True)
                     threading.Event().wait(1)
                 else:
                     self.after(0, self.log_line, f"Task {task['id'][:8]} rejected: {submit.get('reason')}")
@@ -763,7 +851,7 @@ class ClientApp(tk.Tk):
         if not training_loss_accepted(loss_before, loss_after):
             raise RuntimeError(f"Local training did not improve loss ({loss_before:.4f} -> {loss_after:.4f}).")
         elapsed_seconds = time.time() - started
-        if loss_before <= TARGET_LOSS and loss_after <= TARGET_LOSS:
+        if loss_before <= MASTERED_LOSS and loss_after <= MASTERED_LOSS:
             self.after(0, self.log_line, f"Task already learned by shared model (loss {loss_before:.6f}). Confirming completion.")
         else:
             self.after(0, self.log_line, f"Training used {', '.join(used_devices)}. Best loss {loss_before:.4f} -> {loss_after:.4f}.")
@@ -797,79 +885,42 @@ class ClientApp(tk.Tk):
             return
         self.entry.delete(0, tk.END)
         self.chat.insert(tk.END, f"You: {msg}\n")
-        answer = None
-        queued = False
+        self.chat.insert(tk.END, "Archie: thinking...\n")
+        self.chat.see(tk.END)
+        chat_mode = "server"
+        helpers = 0
+        if not self.connected:
+            self.connect(silent=True)
         try:
             self.save_connection_settings(silent=True)
             data = http_json(
                 "POST",
-                self.server_url.get() + "/chat",
+                self.server_url.get() + "/chat_swarm",
                 {"client_id": self.client_id, "message": msg},
-                timeout=30,
+                timeout=120,
             )
-            answer = str(data.get("answer", "")).strip() or None
-            queued = bool(data.get("queued_for_training"))
+            answer = str(data.get("answer", "")).strip() or "Archie did not return an answer."
+            chat_mode = chat_mode_label(str(data.get("mode", "")))
+            helpers = int(data.get("helpers", 0) or 0)
             if not self.connected:
                 self.connected = True
                 self.status.configure(text="Connected")
         except Exception as e:
-            self.log_line(f"Server chat unavailable ({e}). Using local model.")
-        if answer is None:
-            answer = self.answer_from_synced_model(msg)
-            try:
-                learn = http_json(
-                    "POST",
-                    self.server_url.get() + "/learn_chat",
-                    {"client_id": self.client_id, "prompt": msg, "target": answer},
-                    timeout=10,
-                )
-                queued = bool(learn.get("queued"))
-            except Exception:
-                pass
-        self.chat.insert(tk.END, f"Archie: {answer}\n\n")
+            answer = f"Cannot reach Archie on the server ({e}). Check CONNECT and that the server is running."
+            chat_mode = "offline"
+        text = self.chat.get("1.0", tk.END)
+        if "Archie: thinking..." in text:
+            text = text.replace("Archie: thinking...\n", "")
+            self.chat.delete("1.0", tk.END)
+            self.chat.insert(tk.END, text)
+        self.chat.insert(tk.END, f"Archie ({chat_mode}): {answer}\n\n")
         self.chat.see(tk.END)
-        if queued:
-            self.log_line("Chat added to the network training queue.")
-
-    def sync_model(self, silent: bool = False) -> None:
-        if not self.connected:
-            if not self.connect(silent=silent):
-                return
-        try:
-            data = http_json("GET", self.server_url.get() + "/model", timeout=20)
-            package = package_from_b64(data["model_package"])
-            save_local_package(package)
-            self.local_model = package
-            def update_ui() -> None:
-                self.version_lbl.configure(text=f"Model build: {data.get('model_version', 0)}")
-                self.steps_lbl.configure(text=f"Training steps: {data.get('training_steps', 0)}")
-                self.weights_lbl.configure(text=f"Weights: {data.get('model_weights', 0)}")
-                if silent:
-                    self.log_line("Checkpoint synced to shared server model.pt.")
-                else:
-                    self.log_line(
-                        f"Downloaded Archie model.pt build {data.get('model_version', 0)} with {len(package.get('labels', []))} learned answers and {data.get('model_weights', 0)} weights."
-                    )
-            self.after(0, update_ui)
-        except Exception as e:
-            if silent:
-                self.after(0, self.log_line, f"Checkpoint sync error: {e}")
-            else:
-                messagebox.showerror(APP_NAME, str(e))
-
-    def answer_from_synced_model(self, msg: str) -> str:
-        labels = self.local_model.get("labels") or []
-        if not labels or self.local_model.get("state_dict") is None:
-            return "No Archie model.pt synced yet. Click SYNC MODEL after clients train tasks."
-        try:
-            model = make_model(len(self.local_model["vocab"]), len(labels))
-            model.load_state_dict(self.local_model["state_dict"])
-            model.eval()
-            with torch.no_grad():
-                idx = int(torch.argmax(model(vectorise(msg, self.local_model["vocab"])), dim=-1).item())
-            return labels[idx]
-        except Exception:
-            return "I need a synced Kitless model before I can answer properly."
+        if chat_mode == "training":
+            self.log_line("Answer came from network training.")
+        elif chat_mode == "swarm":
+            self.log_line(f"Swarm answer from {helpers} helper client(s) sharing CPU power.")
+        elif chat_mode == "brain":
+            self.log_line("Answer came from Archie brain — upload a teaching pack to train this topic.")
 
 
 if __name__ == "__main__":
