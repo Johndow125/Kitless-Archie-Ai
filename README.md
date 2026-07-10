@@ -34,8 +34,6 @@ Launch:
 
 When the client starts, it automatically synchronises the latest Archie `model.pt`.
 The client launcher starts the GUI without leaving a background CMD window open.
-By default, public clients connect to `https://kitless.co.uk`.
-HTTPS is handled by nginx. Do not expose the local server port `8799` publicly.
 
 The client allows you to:
 
@@ -71,20 +69,6 @@ Kitless uses distributed AI training.
 * Updated Archie models are synchronised across all clients as new versions become available.
 
 Every person who joins the network helps Archie become more capable. The aim is to demonstrate that AI does not have to rely entirely on enormous server farms—it can be powered by people all over the world.
-
----
-
-# Server Access
-
-Public clients should connect through:
-
-`https://kitless.co.uk`
-
-The live server dashboard is available at:
-
-`https://kitless.co.uk/dashboard`
-
-nginx handles HTTPS and proxies requests to the private local server. The local server port `8799` must not be exposed directly to the public internet.
 
 ---
 
