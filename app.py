@@ -10,6 +10,7 @@ import re
 import socket
 import sys
 import threading
+import time
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -28,11 +29,18 @@ except ImportError:
 
 APP_NAME = "Kitless"
 APP_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = APP_DIR.parent
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+
+from shared.help_docs import load_doc, show_help_window
+from shared.settings import TARGET_LOSS, training_loss_accepted
 CLIENT_DATA_DIR = APP_DIR / "client_data"
 CLIENT_CHECKPOINT_DIR = APP_DIR / "client_checkpoint"
 CLIENT_ID_FILE = CLIENT_DATA_DIR / "client_id.txt"
 API_KEY_FILE = CLIENT_DATA_DIR / "api_key.txt"
 SERVER_URL_FILE = CLIENT_DATA_DIR / "server_url.txt"
+DISCLAIMER_ACCEPTED_FILE = CLIENT_DATA_DIR / "disclaimer_accepted.txt"
 LATEST_MODEL_FILE = CLIENT_CHECKPOINT_DIR / "model.pt"
 DEFAULT_SERVER_URL = "https://kitless.co.uk"
 DEFAULT_API_KEY_PARTS = (
@@ -42,6 +50,11 @@ DEFAULT_API_KEY_PARTS = (
     "2fe918ecf15ed619",
 )
 MODEL_KIND = "kitless-linear-archie-v1"
+CHAT_WELCOME = (
+    "Archie chat is here.\n"
+    "This client auto-connects and auto-syncs when the Kitless server is online.\n"
+    "Type below and press SEND TO ARCHIE.\n\n"
+)
 
 
 def default_api_key() -> str:
@@ -265,6 +278,8 @@ class ClientApp(tk.Tk):
         super().__init__()
         self.title("Kitless Client - Archie")
         self.geometry("980x720")
+        self.withdraw()
+        ensure_dirs()
         self.server_url = tk.StringVar(value=local_server_url())
         self.api_key = tk.StringVar(value=local_api_key())
         save_api_key(self.api_key.get())
@@ -276,10 +291,103 @@ class ClientApp(tk.Tk):
         self.keep_training = tk.BooleanVar(value=True)
         self.compute_mode = tk.StringVar(value="BOTH")
         self.local_model = load_local_package()
+        self.loss_history: list[tuple[float, float]] = []
+        self.graph_visible = tk.BooleanVar(value=False)
+        self.log_visible = tk.BooleanVar(value=False)
         self._build()
+        if not self.show_startup_disclaimer():
+            return
+        self.deiconify()
+        self._build_menu()
+        self.apply_view_menu()
+        self.after(500, self.auto_startup_sync)
         self.after(1500, self._heartbeat_loop)
 
+    def auto_startup_sync(self) -> None:
+        threading.Thread(target=lambda: self.sync_model(silent=True), daemon=True).start()
+
+    def show_startup_disclaimer(self) -> bool:
+        if DISCLAIMER_ACCEPTED_FILE.exists():
+            return True
+
+        accepted = {"ok": False}
+        win = tk.Toplevel(self)
+        win.title("Kitless Disclaimer")
+        win.geometry("780x580")
+        win.minsize(660, 480)
+        win.configure(bg="#120b1d")
+        win.grab_set()
+        win.lift()
+        win.focus_force()
+        try:
+            win.attributes("-topmost", True)
+            win.after(750, lambda: win.attributes("-topmost", False))
+        except tk.TclError:
+            pass
+        win.update_idletasks()
+
+        def open_help_window(action) -> None:
+            win.grab_release()
+            action()
+            win.lift()
+
+        def close_app() -> None:
+            accepted["ok"] = False
+            win.destroy()
+            self.destroy()
+
+        def accept() -> None:
+            DISCLAIMER_ACCEPTED_FILE.parent.mkdir(parents=True, exist_ok=True)
+            DISCLAIMER_ACCEPTED_FILE.write_text("accepted=8/07/2026\n", encoding="utf-8")
+            accepted["ok"] = True
+            win.destroy()
+
+        header = tk.Frame(win, bg="#211332", padx=18, pady=14)
+        header.pack(fill=tk.X)
+        tk.Label(header, text="Before using Kitless", fg="#ffffff", bg="#211332", font=("Segoe UI", 20, "bold")).pack(anchor=tk.W)
+        tk.Label(header, text="Please read and accept the important notices", fg="#d0b7ff", bg="#211332", font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
+        tk.Frame(win, bg="#a371f7", height=3).pack(fill=tk.X)
+
+        body = tk.Frame(win, bg="#120b1d", padx=18, pady=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        msg = (
+            "Kitless is open-source distributed AI software. By using it, you accept that you are responsible for your own device, server configuration, data, messages, contributed compute, and use of AI output.\n\n"
+            "Archie can be wrong. Do not rely on Archie for medical, legal, financial, emergency, safety-critical, or other high-risk decisions.\n\n"
+            "When training is enabled, this computer may use CPU, GPU, memory, storage, network bandwidth, and electrical power.\n\n"
+            "Please read the Licence, Privacy Policy, and Terms of Service before continuing."
+        )
+        tk.Label(body, text=msg, fg="#f2e7ff", bg="#120b1d", font=("Segoe UI", 11), justify=tk.LEFT, wraplength=720).pack(fill=tk.X, anchor=tk.W)
+
+        links = ttk.Frame(body)
+        links.pack(fill=tk.X, pady=16)
+        ttk.Button(links, text="Read Licence", command=lambda: open_help_window(self.show_licence)).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(links, text="Read Privacy Policy", command=lambda: open_help_window(self.show_privacy_policy)).pack(side=tk.LEFT, padx=8)
+        ttk.Button(links, text="Read Terms of Service", command=lambda: open_help_window(self.show_terms_of_service)).pack(side=tk.LEFT, padx=8)
+
+        ticked = tk.BooleanVar(value=False)
+        footer = ttk.Frame(body)
+        footer.pack(fill=tk.X, side=tk.BOTTOM)
+        accept_button = ttk.Button(footer, text="Accept and continue", command=accept, state=tk.DISABLED)
+
+        def update_accept_state() -> None:
+            accept_button.configure(state=tk.NORMAL if ticked.get() else tk.DISABLED)
+
+        ttk.Checkbutton(
+            body,
+            text="I have read and accept the Licence, Privacy Policy, Terms of Service, and disclaimer.",
+            variable=ticked,
+            command=update_accept_state,
+        ).pack(anchor=tk.W, pady=(8, 16))
+
+        ttk.Button(footer, text="Exit", command=close_app).pack(side=tk.RIGHT, padx=(8, 0))
+        accept_button.pack(side=tk.RIGHT)
+
+        win.protocol("WM_DELETE_WINDOW", close_app)
+        self.wait_window(win)
+        return accepted["ok"]
+
     def _build(self) -> None:
+        self._build_menu()
         self.configure(bg="#101623")
         hero = tk.Frame(self, bg="#101623", padx=18, pady=14)
         hero.pack(fill=tk.X)
@@ -295,7 +403,8 @@ class ClientApp(tk.Tk):
         ttk.Button(card, text="SAVE", command=lambda: self.save_connection_settings(silent=False)).pack(side=tk.LEFT, padx=4)
         ttk.Button(card, text="CONNECT", command=self.connect).pack(side=tk.LEFT, padx=4)
         ttk.Button(card, text="SYNC MODEL", command=self.sync_model).pack(side=tk.LEFT, padx=4)
-        ttk.Button(card, text="CONTRIBUTE TRAINING", command=self.toggle_contribute).pack(side=tk.LEFT, padx=4)
+        self.training_btn = ttk.Button(card, text="START TRAINING", command=self.toggle_contribute)
+        self.training_btn.pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(card, text="KEEP RETRAINING", variable=self.keep_training).pack(side=tk.LEFT, padx=4)
         self.status = ttk.Label(card, text="Offline")
         self.status.pack(side=tk.RIGHT)
@@ -328,28 +437,179 @@ class ClientApp(tk.Tk):
         self.round_lbl = ttk.Label(stats, text="Round: 0")
         self.round_lbl.pack(side=tk.LEFT, padx=10)
 
-        self.log = scrolledtext.ScrolledText(self, height=8, font=("Consolas", 10))
-        self.log.pack(fill=tk.X, padx=14, pady=8)
-
-        chat_box = ttk.LabelFrame(self, text="Talk To Archie", padding=10)
-        chat_box.pack(fill=tk.BOTH, expand=True, padx=14, pady=8)
-        self.chat = scrolledtext.ScrolledText(chat_box, font=("Segoe UI", 11), height=12, wrap=tk.WORD)
+        self.chat_box = ttk.LabelFrame(self, text="Talk To Archie", padding=10)
+        self.chat_box.pack(fill=tk.BOTH, expand=True, padx=14, pady=8)
+        self.chat = scrolledtext.ScrolledText(self.chat_box, font=("Segoe UI", 11), height=12, wrap=tk.WORD)
         self.chat.pack(fill=tk.BOTH, expand=True)
-        self.chat.insert(
-            tk.END,
-            "Archie chat is here.\n"
-            "1. CONNECT to the server.\n"
-            "2. Click SYNC MODEL after some training has completed.\n"
-            "3. Type below and press SEND TO ARCHIE.\n\n",
-        )
+        self.chat.insert(tk.END, CHAT_WELCOME)
 
-        row = ttk.Frame(self, padding=12)
-        row.pack(fill=tk.X)
-        ttk.Label(row, text="Message Archie").pack(side=tk.LEFT, padx=(0, 8))
-        self.entry = ttk.Entry(row, font=("Segoe UI", 12))
+        self.message_row = ttk.Frame(self.chat_box, padding=(0, 8, 0, 0))
+        self.message_row.pack(fill=tk.X)
+        self.entry = ttk.Entry(self.message_row, font=("Segoe UI", 12))
         self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         self.entry.bind("<Return>", lambda _e: self.send_chat())
-        ttk.Button(row, text="SEND TO ARCHIE", command=self.send_chat).pack(side=tk.RIGHT)
+        chat_actions = ttk.Frame(self.message_row)
+        chat_actions.pack(side=tk.RIGHT)
+        ttk.Button(chat_actions, text="CLEAR CHAT", command=self.clear_chat).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(chat_actions, text="SEND TO ARCHIE", command=self.send_chat).pack(side=tk.LEFT)
+
+        self.graph_box = ttk.LabelFrame(self, text="Training Graph (local client only)", padding=10)
+        self.graph_canvas = tk.Canvas(self.graph_box, height=150, bg="#0d1420", highlightthickness=0)
+        self.graph_canvas.pack(fill=tk.X)
+        self.graph_info = ttk.Label(
+            self.graph_box,
+            text="Waiting for local training data. Green = before training. Blue = after training, and blue is the better result when it is lower.",
+        )
+        self.graph_info.pack(anchor=tk.W, pady=(6, 0))
+        self.graph_canvas.bind("<Configure>", lambda _event: self.draw_loss_graph())
+
+        self.log = scrolledtext.ScrolledText(self, height=8, font=("Consolas", 10))
+        self.apply_view_menu()
+
+    def _build_menu(self) -> None:
+        menu = tk.Menu(self)
+        file_menu = tk.Menu(menu, tearoff=False)
+        file_menu.add_command(label="Exit", command=self.destroy)
+        menu.add_cascade(label="File", menu=file_menu)
+
+        view_menu = tk.Menu(menu, tearoff=False)
+        view_menu.add_checkbutton(label="Training Graph", variable=self.graph_visible, command=self.apply_view_menu)
+        view_menu.add_checkbutton(label="Terminal Log", variable=self.log_visible, command=self.apply_view_menu)
+        view_menu.add_separator()
+        view_menu.add_command(label="Clear Chat", command=self.clear_chat)
+        menu.add_cascade(label="View", menu=view_menu)
+
+        help_menu = tk.Menu(menu, tearoff=False)
+        help_menu.add_command(label="FAQ", command=self.show_faq)
+        help_menu.add_command(label="Licence", command=self.show_licence)
+        help_menu.add_command(label="Privacy Policy", command=self.show_privacy_policy)
+        help_menu.add_command(label="Terms of Service", command=self.show_terms_of_service)
+        help_menu.add_separator()
+        help_menu.add_command(label="About", command=self.show_about)
+        menu.add_cascade(label="Help", menu=help_menu)
+        self.configure(menu=menu)
+
+    def apply_view_menu(self) -> None:
+        self.graph_box.pack_forget()
+        self.log.pack_forget()
+        if self.graph_visible.get():
+            self.graph_box.pack(fill=tk.X, padx=14, pady=6, after=self.chat_box)
+            self.draw_loss_graph()
+        if self.log_visible.get():
+            after_widget = self.graph_box if self.graph_visible.get() else self.chat_box
+            self.log.pack(fill=tk.X, padx=14, pady=8, after=after_widget)
+
+    def record_training_graph(self, loss_before: float, loss_after: float, elapsed_seconds: float) -> None:
+        self.loss_history.append((loss_before, loss_after))
+        self.loss_history = self.loss_history[-60:]
+        self.graph_info.configure(
+            text=f"Green before {loss_before:.6f}, blue after {loss_after:.6f}. If blue is lower than green, Archie improved. Task time {elapsed_seconds:.1f}s"
+        )
+        self.draw_loss_graph()
+
+    def draw_loss_graph(self) -> None:
+        canvas = self.graph_canvas
+        canvas.delete("all")
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        pad = 18
+        canvas.create_text(pad, 12, anchor=tk.W, fill="#9fb3d1", text="Local training loss - blue lower than green is better")
+        canvas.create_line(pad, height - pad, width - pad, height - pad, fill="#2a3a52")
+        canvas.create_line(pad, pad, pad, height - pad, fill="#2a3a52")
+        if not self.loss_history:
+            canvas.create_text(width // 2, height // 2, fill="#9fb3d1", text="Start training to draw live loss graphs")
+            return
+        values = [value for pair in self.loss_history for value in pair]
+        lo = min(values)
+        hi = max(values)
+        span = hi - lo or 1.0
+
+        def point(index: int, value: float) -> tuple[float, float]:
+            x = pad if len(self.loss_history) == 1 else pad + (index / (len(self.loss_history) - 1)) * (width - (pad * 2))
+            y = height - pad - ((value - lo) / span) * (height - (pad * 2))
+            return x, y
+
+        before_points = [point(index, pair[0]) for index, pair in enumerate(self.loss_history)]
+        after_points = [point(index, pair[1]) for index, pair in enumerate(self.loss_history)]
+        if len(before_points) > 1:
+            canvas.create_line(*[coord for point_pair in before_points for coord in point_pair], fill="#7ee787", width=2)
+        if len(after_points) > 1:
+            canvas.create_line(*[coord for point_pair in after_points for coord in point_pair], fill="#58a6ff", width=2)
+        for x, y in before_points:
+            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#7ee787", outline="")
+        for x, y in after_points:
+            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#58a6ff", outline="")
+
+    def show_faq(self) -> None:
+        show_help_window(
+            self,
+            "Kitless Client FAQ",
+            (
+                "Kitless Public Client FAQ\n\n"
+                "Talk To Archie\n"
+                "Type a message and press SEND TO ARCHIE. Archie answers from the synchronised model.pt on this computer.\n\n"
+                "CONNECT\n"
+                "Connects this client to the Kitless server.\n\n"
+                "SYNC MODEL\n"
+                "Downloads the latest shared Archie model.pt to this computer.\n\n"
+                "START TRAINING / STOP TRAINING\n"
+                "Starts or pauses local training contribution. While training is on, this computer helps improve the shared model.\n\n"
+                "KEEP RETRAINING\n"
+                "Keeps asking the server for more training work after a task finishes.\n\n"
+                "Training Power: CPU / GPU / BOTH\n"
+                "Chooses which hardware can train. BOTH uses GPU first when available, then CPU adds more work.\n\n"
+                "Network Status\n"
+                "Shows online clients, model build, training steps, weights, open tasks, completed tasks, contributions, and training round.\n\n"
+                "View Menu\n"
+                "The Training Graph shows local loss before and after training. The Terminal Log shows client events and errors. Clear Chat wipes the chat window on this PC only.\n\n"
+                "Clear Chat\n"
+                "Use CLEAR CHAT or View -> Clear Chat when you are finished. This only clears the chat display on your computer. It does not delete server training data.\n\n"
+                "How Sync Works\n"
+                "Model sync downloads the latest shared Archie model.pt to this computer.\n"
+                "- On startup: about half a second after the client opens, if the server is online.\n"
+                "- While training: after each training task your client completes and the server accepts.\n"
+                "- Manual: click SYNC MODEL any time.\n"
+                "Sending a chat message does not download a new model.pt. The message is sent to the server straight away for Archie to answer, and good question-and-answer pairs may be queued for future training.\n"
+                "Network status (online count, open tasks, model build) refreshes about every 3 seconds while connected.\n\n"
+                "Graph Colours\n"
+                "Green is loss before training. Blue is loss after training. Lower blue means the task improved.\n"
+            ),
+            subtitle="Kitless Client Help Centre",
+        )
+
+    def show_about(self) -> None:
+        readme = None
+        for base in (PROJECT_ROOT, APP_DIR):
+            candidate = base / "README.md"
+            if candidate.exists():
+                readme = candidate
+                break
+        text = readme.read_text(encoding="utf-8") if readme else "Kitless README.md was not found."
+        show_help_window(self, "About Kitless", text, subtitle="Kitless Client Help Centre")
+
+    def show_licence(self) -> None:
+        show_help_window(
+            self,
+            "Kitless Licence",
+            load_doc("LICENCE.txt", "Kitless licence file was not found."),
+            subtitle="Kitless Client Help Centre",
+        )
+
+    def show_privacy_policy(self) -> None:
+        show_help_window(
+            self,
+            "Kitless Privacy Policy",
+            load_doc("PRIVACY.txt", "Kitless privacy policy file was not found."),
+            subtitle="Kitless Client Help Centre",
+        )
+
+    def show_terms_of_service(self) -> None:
+        show_help_window(
+            self,
+            "Kitless Terms of Service",
+            load_doc("TERMS.txt", "Kitless terms of service file was not found."),
+            subtitle="Kitless Client Help Centre",
+        )
 
     def log_line(self, text: str) -> None:
         self.log.insert(tk.END, text + "\n")
@@ -365,7 +625,7 @@ class ClientApp(tk.Tk):
         if not silent:
             messagebox.showinfo(APP_NAME, "Connection settings saved.")
 
-    def connect(self) -> None:
+    def connect(self, silent: bool = False) -> bool:
         try:
             self.save_connection_settings(silent=True)
             data = http_json(
@@ -377,8 +637,13 @@ class ClientApp(tk.Tk):
             self.status.configure(text="Connected")
             self.apply_status(data["status"])
             self.log_line("Connected to Kitless Server.")
+            return True
         except Exception as e:
-            messagebox.showerror(APP_NAME, str(e))
+            if silent:
+                self.log_line(f"Auto-connect waiting for server: {e}")
+            else:
+                messagebox.showerror(APP_NAME, str(e))
+            return False
 
     def apply_status(self, s: dict) -> None:
         self.online_lbl.configure(text=f"Online: {s.get('online', 0)}")
@@ -405,7 +670,14 @@ class ClientApp(tk.Tk):
         if not self.connected:
             self.connect()
         self.contributing = not self.contributing
-        self.log_line("Training contribution started." if self.contributing else "Training contribution stopped.")
+        if self.contributing:
+            self.training_btn.configure(text="STOP TRAINING")
+            self.status.configure(text="Training")
+            self.log_line("Training contribution started. Press STOP TRAINING to pause and chat.")
+        else:
+            self.training_btn.configure(text="START TRAINING")
+            self.status.configure(text="Connected" if self.connected else "Offline")
+            self.log_line("Training contribution stopped. You can talk to Archie, then press START TRAINING again.")
         if self.contributing:
             threading.Thread(target=self.contribution_loop, daemon=True).start()
 
@@ -447,6 +719,7 @@ class ClientApp(tk.Tk):
                 threading.Event().wait(5)
 
     def process_training_task(self, task: dict, model_package: str) -> dict:
+        started = time.time()
         prompt = task["prompt"]
         target = task["target"]
         package = package_from_b64(model_package)
@@ -487,9 +760,14 @@ class ClientApp(tk.Tk):
             raise RuntimeError("No training device was available.")
         loss_before = best_before
         loss_after = best_after
-        if loss_after >= loss_before:
+        if not training_loss_accepted(loss_before, loss_after):
             raise RuntimeError(f"Local training did not improve loss ({loss_before:.4f} -> {loss_after:.4f}).")
-        self.after(0, self.log_line, f"Training used {', '.join(used_devices)}. Best loss {loss_before:.4f} -> {loss_after:.4f}.")
+        elapsed_seconds = time.time() - started
+        if loss_before <= TARGET_LOSS and loss_after <= TARGET_LOSS:
+            self.after(0, self.log_line, f"Task already learned by shared model (loss {loss_before:.6f}). Confirming completion.")
+        else:
+            self.after(0, self.log_line, f"Training used {', '.join(used_devices)}. Best loss {loss_before:.4f} -> {loss_after:.4f}.")
+        self.after(0, self.record_training_graph, loss_before, loss_after, elapsed_seconds)
         package["state_dict"] = best_state
         words = re.findall(r"[a-zA-Z']+", f"{prompt} {target}".lower())
         stop = {"the", "and", "you", "are", "with", "that", "this", "from", "what", "who", "how", "why", "for"}
@@ -508,18 +786,55 @@ class ClientApp(tk.Tk):
             "model_package": package_to_b64(package),
         }
 
+    def clear_chat(self) -> None:
+        self.chat.delete("1.0", tk.END)
+        self.chat.insert(tk.END, CHAT_WELCOME)
+        self.chat.see(tk.END)
+
     def send_chat(self) -> None:
         msg = self.entry.get().strip()
         if not msg:
             return
         self.entry.delete(0, tk.END)
         self.chat.insert(tk.END, f"You: {msg}\n")
-        self.chat.insert(tk.END, f"Archie: {self.answer_from_synced_model(msg)}\n\n")
+        answer = None
+        queued = False
+        try:
+            self.save_connection_settings(silent=True)
+            data = http_json(
+                "POST",
+                self.server_url.get() + "/chat",
+                {"client_id": self.client_id, "message": msg},
+                timeout=30,
+            )
+            answer = str(data.get("answer", "")).strip() or None
+            queued = bool(data.get("queued_for_training"))
+            if not self.connected:
+                self.connected = True
+                self.status.configure(text="Connected")
+        except Exception as e:
+            self.log_line(f"Server chat unavailable ({e}). Using local model.")
+        if answer is None:
+            answer = self.answer_from_synced_model(msg)
+            try:
+                learn = http_json(
+                    "POST",
+                    self.server_url.get() + "/learn_chat",
+                    {"client_id": self.client_id, "prompt": msg, "target": answer},
+                    timeout=10,
+                )
+                queued = bool(learn.get("queued"))
+            except Exception:
+                pass
+        self.chat.insert(tk.END, f"Archie: {answer}\n\n")
         self.chat.see(tk.END)
+        if queued:
+            self.log_line("Chat added to the network training queue.")
 
     def sync_model(self, silent: bool = False) -> None:
         if not self.connected:
-            self.connect()
+            if not self.connect(silent=silent):
+                return
         try:
             data = http_json("GET", self.server_url.get() + "/model", timeout=20)
             package = package_from_b64(data["model_package"])
@@ -558,5 +873,6 @@ class ClientApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    exit_when_parent_closes()
+    if not sys.executable.lower().endswith("pythonw.exe"):
+        exit_when_parent_closes()
     ClientApp().mainloop()
