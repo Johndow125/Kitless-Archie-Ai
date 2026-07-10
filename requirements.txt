@@ -1,0 +1,20 @@
+torch>=2.0
+torch-directml; platform_system == "Windows"
+transformers
+tokenizers
+sentencepiece
+datasets
+accelerate
+peft
+safetensors
+evaluate
+tensorboard
+scikit-learn
+tqdm
+ray
+faiss-cpu
+onnx<1.15
+onnxruntime
+protobuf==3.20.3
+numpy<2
+deepspeed; platform_system != "Windows"
