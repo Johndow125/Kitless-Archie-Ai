@@ -5,6 +5,7 @@ MASTERED_LOSS = 0.01
 
 CHAT_MODE_LABELS = {
     "trained": "training",
+    "trained+brain": "brain+training",
     "brain": "brain",
     "linear": "network",
     "swarm": "swarm",

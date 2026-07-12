@@ -30,8 +30,17 @@ except ImportError:
 APP_NAME = "Kitless"
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_DIR.parent
-if str(APP_DIR) not in sys.path:
-    sys.path.insert(0, str(APP_DIR))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from shared.pool_chat import (
+    brain_ready_local,
+    handle_pool_chat_job,
+    poll_pool_chat_work,
+    submit_pool_chat_result,
+    sync_brain_from_server,
+)
+from shared.archie_brain import is_archie_brain_file
 
 from shared.chat_reply import chat_answer_from_label, direct_chat_reply
 from shared.help_docs import load_doc, show_help_window
@@ -53,8 +62,8 @@ DEFAULT_API_KEY_PARTS = (
 MODEL_KIND = "kitless-linear-archie-v1"
 CHAT_WELCOME = (
     "Archie chat is here.\n"
-    "Connected clients share CPU power to answer together — the server only coordinates the swarm.\n"
-    "Type below and press SEND TO ARCHIE. Press START TRAINING to join network training power.\n\n"
+    "The server hosts model.pt — your PC (and the pool) runs the brain when you talk to Archie.\n"
+    "Stay connected so pool chat can use your CPU/GPU. Press START TRAINING to add network teaching.\n\n"
 )
 
 
@@ -186,7 +195,56 @@ def http_json(method: str, url: str, payload: dict | None = None, timeout: int =
             data = json.loads(e.read().decode("utf-8"))
         except Exception:
             data = {"error": str(e)}
-        raise RuntimeError(data.get("error", str(e))) from e
+        raise RuntimeError(f"{url}: {data.get('error', str(e))}") from e
+
+
+def is_stale_swarm_chat_response(data: dict) -> bool:
+    stale_modes = frozenset({"swarm", "swarm-timeout", "direct", "quick", "linear", "network"})
+    mode = str(data.get("mode", "")).strip().lower()
+    if mode in stale_modes:
+        return True
+    answer = str(data.get("answer", "")).strip()
+    prefixes = (
+        "No swarm helper answered",
+        "Leave more clients connected with synced model.pt",
+    )
+    return any(answer.startswith(prefix) for prefix in prefixes)
+
+
+def is_network_server_outdated(status: dict | None) -> bool:
+    if not status:
+        return False
+    return status.get("chat_backend") != "pool"
+
+
+STALE_SERVER_CHAT_MESSAGE = (
+    "kitless.co.uk is not running pool chat yet. "
+    "Upload updated app.py + shared/ to the server and restart kitless. "
+    "Until then use http://127.0.0.1:8799 with START_SERVER.bat."
+)
+
+
+def request_archie_chat(server_url: str, client_id: str, message: str, timeout: int = 900) -> dict:
+    base = server_url.rstrip("/")
+    payload = {"client_id": client_id, "message": message}
+    last_error: Exception | None = None
+    for path in ("/chat", "/chat_swarm"):
+        url = f"{base}{path}"
+        try:
+            data = http_json("POST", url, payload, timeout=timeout)
+        except RuntimeError as e:
+            last_error = e
+            text = str(e).lower()
+            if path == "/chat" and ("404" in text or "not found" in text):
+                continue
+            raise
+        if is_stale_swarm_chat_response(data):
+            raise RuntimeError(STALE_SERVER_CHAT_MESSAGE)
+        return data
+    raise RuntimeError(
+        f"Server has no working chat endpoint ({last_error}). "
+        "Deploy updated server/app.py and add nginx /chat proxy."
+    )
 
 
 def word_list(text: str) -> list[str]:
@@ -261,24 +319,6 @@ def save_local_package(package: dict) -> None:
     torch.save(package, LATEST_MODEL_FILE)
 
 
-def best_label_from_output_shard(package: dict, msg: str, start: int, end: int) -> tuple[int, str, float]:
-    labels = package.get("labels") or []
-    state_dict = package.get("state_dict") or {}
-    if not labels or start < 0 or end <= start or end > len(labels):
-        raise RuntimeError("Invalid swarm chat shard.")
-    weight = state_dict.get("weight")
-    bias = state_dict.get("bias")
-    if weight is None:
-        raise RuntimeError("Synchronised model has no output weights.")
-    x = vectorise(msg, package["vocab"])
-    shard_logits = x.matmul(weight[start:end].t())[0]
-    if bias is not None:
-        shard_logits = shard_logits + bias[start:end]
-    local_idx = int(torch.argmax(shard_logits).item())
-    label_index = start + local_idx
-    return label_index, labels[label_index], float(shard_logits[local_idx].item())
-
-
 def loss_for_package(package: dict, prompt: str, target: str) -> float:
     labels = package.get("labels") or []
     if target not in labels:
@@ -310,10 +350,11 @@ class ClientApp(tk.Tk):
         self.keep_training = tk.BooleanVar(value=True)
         self.compute_mode = tk.StringVar(value="BOTH")
         self.local_model = load_local_package()
+        self.pool_size = 1
+        self.pool_mode = "solo"
         self.loss_history: list[tuple[float, float]] = []
         self.graph_visible = tk.BooleanVar(value=False)
         self.log_visible = tk.BooleanVar(value=False)
-        self._swarm_thread_started = False
         self._build()
         if not self.show_startup_disclaimer():
             return
@@ -322,6 +363,7 @@ class ClientApp(tk.Tk):
         self.apply_view_menu()
         self.after(500, self.auto_startup_connect)
         self.after(1500, self._heartbeat_loop)
+        threading.Thread(target=self._pool_chat_loop, daemon=True).start()
 
     def auto_startup_connect(self) -> None:
         threading.Thread(target=lambda: self.connect(silent=True), daemon=True).start()
@@ -412,7 +454,7 @@ class ClientApp(tk.Tk):
         hero = tk.Frame(self, bg="#101623", padx=18, pady=14)
         hero.pack(fill=tk.X)
         tk.Label(hero, text="Kitless", fg="#ffffff", bg="#101623", font=("Segoe UI", 24, "bold")).pack(anchor=tk.W)
-        tk.Label(hero, text="Public Client — swarm chat and shared training power across the network", fg="#9fb3d1", bg="#101623", font=("Segoe UI", 11)).pack(anchor=tk.W)
+        tk.Label(hero, text="Public Client — pool chat and shared training power across the network", fg="#9fb3d1", bg="#101623", font=("Segoe UI", 11)).pack(anchor=tk.W)
 
         card = ttk.Frame(self, padding=12)
         card.pack(fill=tk.X, padx=14, pady=8)
@@ -652,9 +694,12 @@ class ClientApp(tk.Tk):
             self.status.configure(text="Connected")
             self.apply_status(data["status"])
             self.sync_model_from_server(silent=True)
-            self.ensure_swarm_helper()
+            threading.Thread(
+                target=lambda: self.sync_brain_from_server(silent=not is_archie_brain_file()),
+                daemon=True,
+            ).start()
             pool_size = int((data.get("status") or {}).get("pool_size", (data.get("status") or {}).get("online", 0)) or 0)
-            self.log_line(f"Joined network pool ({pool_size} client(s) sharing CPU).")
+            self.log_line(f"Connected to Kitless Server. Pool: {pool_size}. Pool chat runs on connected PCs.")
             return True
         except Exception as e:
             if silent:
@@ -664,7 +709,17 @@ class ClientApp(tk.Tk):
             return False
 
     def apply_status(self, s: dict) -> None:
-        self.online_lbl.configure(text=f"Pool: {s.get('pool_size', s.get('online', 0))}")
+        pool_size = int(s.get("pool_size", s.get("online", 0)) or 0)
+        pool_mode = str(s.get("pool_mode", "solo" if pool_size <= 1 else "swarm"))
+        if pool_size != self.pool_size or pool_mode != self.pool_mode:
+            if pool_size <= 1:
+                self.log_line(f"Pool: {pool_size} client online.")
+            else:
+                self.log_line(f"Pool: {pool_size} clients online — training power shared.")
+        self.pool_size = pool_size
+        self.pool_mode = pool_mode
+        mode_label = "swarm" if pool_mode == "swarm" else "solo"
+        self.online_lbl.configure(text=f"Pool: {pool_size} ({mode_label})")
         self.version_lbl.configure(text=f"Model build: {s.get('model_version', 0)}")
         self.steps_lbl.configure(text=f"Training steps: {s.get('training_steps', s.get('contributions', 0))}")
         self.weights_lbl.configure(text=f"Weights: {s.get('model_weights', 0)}")
@@ -674,6 +729,16 @@ class ClientApp(tk.Tk):
         self.done_lbl.configure(text=f"Completed: {s.get('completed_tasks', 0)}")
         self.contrib_lbl.configure(text=f"Contributions: {s.get('contributions', 0)}")
         self.round_lbl.configure(text=f"Round: {s.get('training_round', 0)}")
+        if s.get("chat_backend") != "pool":
+            if not getattr(self, "_warned_stale_server", False):
+                self._warned_stale_server = True
+                self.log_line(
+                    "Network server outdated: pool chat is not live on kitless.co.uk. "
+                    "Upload updated app.py + shared/, restart kitless."
+                )
+        elif s.get("brain_ready") is False and not getattr(self, "_warned_no_brain", False):
+            self._warned_no_brain = True
+            self.log_line("Warning: Archie brain (model.pt) is not hosted on the server yet.")
         self.maybe_sync_model(s.get("model_version", 0))
 
     def sync_model_from_server(self, silent: bool = False) -> bool:
@@ -698,52 +763,59 @@ class ClientApp(tk.Tk):
         if int(remote_version or 0) != int(self.local_model.get("version", 0) or 0):
             threading.Thread(target=lambda: self.sync_model_from_server(silent=True), daemon=True).start()
 
-    def ensure_swarm_helper(self) -> None:
-        if self._swarm_thread_started:
-            return
-        self._swarm_thread_started = True
-        threading.Thread(target=self.swarm_helper_loop, daemon=True).start()
+    def sync_brain_from_server(self, silent: bool = False) -> bool:
+        try:
+            return sync_brain_from_server(
+                http_json,
+                self.server_url.get(),
+                api_key=local_api_key(),
+                log=None if silent else lambda text: self.after(0, self.log_line, text),
+            )
+        except Exception as e:
+            if not silent:
+                self.after(0, self.log_line, f"Brain sync failed: {e}")
+            return False
 
-    def swarm_helper_loop(self) -> None:
+    def _pool_chat_loop(self) -> None:
         while True:
             if not self.connected:
-                threading.Event().wait(1)
+                time.sleep(2)
                 continue
             try:
-                if not self.local_model.get("state_dict"):
-                    self.sync_model_from_server(silent=True)
-                    threading.Event().wait(2)
+                work = poll_pool_chat_work(
+                    http_json,
+                    self.server_url.get(),
+                    self.client_id,
+                    timeout=15,
+                )
+                if not work:
+                    time.sleep(0.25)
                     continue
-                work = http_json(
-                    "POST",
-                    self.server_url.get() + "/chat_work",
-                    {"client_id": self.client_id},
-                    timeout=8,
+                job_id = str(work["job_id"])
+                mode_hint = str(work.get("mode_hint") or "brain")
+                answer, mode = handle_pool_chat_job(
+                    work,
+                    http_json,
+                    self.server_url.get(),
+                    api_key=local_api_key(),
+                    log=lambda text: self.after(0, self.log_line, text),
                 )
-                if not work.get("job_id"):
-                    threading.Event().wait(1)
-                    continue
-                label_index, label, score = best_label_from_output_shard(
-                    self.local_model,
-                    str(work.get("message", "")),
-                    int(work.get("start", 0)),
-                    int(work.get("end", 0)),
+                if mode == "none":
+                    mode = mode_hint
+                submit_pool_chat_result(
+                    http_json,
+                    self.server_url.get(),
+                    self.client_id,
+                    job_id,
+                    answer,
+                    mode,
+                    timeout=60,
                 )
-                http_json(
-                    "POST",
-                    self.server_url.get() + "/chat_result",
-                    {
-                        "client_id": self.client_id,
-                        "job_id": work["job_id"],
-                        "shard_index": work["shard_index"],
-                        "label_index": label_index,
-                        "label": label,
-                        "score": score,
-                    },
-                    timeout=8,
-                )
-            except Exception:
-                threading.Event().wait(2)
+                self.after(0, self.log_line, f"Pool chat answered on this PC (job {job_id[:8]}).")
+            except Exception as e:
+                if self.connected:
+                    self.after(0, self.log_line, f"Pool chat worker: {e}")
+                time.sleep(2)
 
     def _heartbeat_loop(self) -> None:
         if self.connected:
@@ -885,42 +957,50 @@ class ClientApp(tk.Tk):
             return
         self.entry.delete(0, tk.END)
         self.chat.insert(tk.END, f"You: {msg}\n")
-        self.chat.insert(tk.END, "Archie: thinking...\n")
+        if not brain_ready_local():
+            self.chat.insert(tk.END, "Archie: downloading brain (model.pt) to this PC first — then answering...\n")
+        else:
+            self.chat.insert(tk.END, "Archie: thinking...\n")
         self.chat.see(tk.END)
+        threading.Thread(target=self._chat_worker, args=(msg,), daemon=True).start()
+
+    def _chat_worker(self, msg: str) -> None:
         chat_mode = "server"
-        helpers = 0
         if not self.connected:
             self.connect(silent=True)
+        if not brain_ready_local():
+            self.sync_brain_from_server(silent=False)
         try:
             self.save_connection_settings(silent=True)
-            data = http_json(
-                "POST",
-                self.server_url.get() + "/chat_swarm",
-                {"client_id": self.client_id, "message": msg},
-                timeout=120,
-            )
+            data = request_archie_chat(self.server_url.get(), self.client_id, msg, timeout=900)
             answer = str(data.get("answer", "")).strip() or "Archie did not return an answer."
             chat_mode = chat_mode_label(str(data.get("mode", "")))
-            helpers = int(data.get("helpers", 0) or 0)
             if not self.connected:
                 self.connected = True
-                self.status.configure(text="Connected")
+                self.after(0, lambda: self.status.configure(text="Connected"))
         except Exception as e:
             answer = f"Cannot reach Archie on the server ({e}). Check CONNECT and that the server is running."
             chat_mode = "offline"
-        text = self.chat.get("1.0", tk.END)
-        if "Archie: thinking..." in text:
-            text = text.replace("Archie: thinking...\n", "")
-            self.chat.delete("1.0", tk.END)
-            self.chat.insert(tk.END, text)
-        self.chat.insert(tk.END, f"Archie ({chat_mode}): {answer}\n\n")
-        self.chat.see(tk.END)
+
+        def show_answer() -> None:
+            text = self.chat.get("1.0", tk.END)
+            if "Archie: thinking..." in text or "Archie: downloading brain" in text:
+                text = text.replace("Archie: thinking...\n", "")
+                text = text.replace("Archie: downloading brain (model.pt) to this PC first — then answering...\n", "")
+                self.chat.delete("1.0", tk.END)
+                self.chat.insert(tk.END, text)
+            self.chat.insert(tk.END, f"Archie ({chat_mode}): {answer}\n\n")
+            self.chat.see(tk.END)
+
+        self.after(0, show_answer)
         if chat_mode == "training":
-            self.log_line("Answer came from network training.")
-        elif chat_mode == "swarm":
-            self.log_line(f"Swarm answer from {helpers} helper client(s) sharing CPU power.")
+            self.after(0, self.log_line, "Answer from network training.")
+        elif chat_mode == "brain+training":
+            self.after(0, self.log_line, "Answer from Archie brain (model.pt) with network training facts.")
         elif chat_mode == "brain":
-            self.log_line("Answer came from Archie brain — upload a teaching pack to train this topic.")
+            self.after(0, self.log_line, "Answer from pool brain (model.pt on a connected PC).")
+        elif chat_mode == "pool-timeout":
+            self.after(0, self.log_line, "No pool client answered in time — stay connected with synced brain.")
 
 
 if __name__ == "__main__":
